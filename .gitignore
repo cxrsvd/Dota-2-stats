@@ -4,3 +4,5 @@ publish/
 Releases/
 .vs/
 *.user
+CLAUDE.md
+*.code-workspace
