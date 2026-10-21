@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWindowsForms>true</UseWindowsForms>
+    <NoWarn>$(NoWarn);WFO1000</NoWarn>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+
+    <!-- Метаданные exe (Свойства → Подробно). Пустые данные об авторе повышают шанс ложного срабатывания Defender. -->
+    <Authors>crossik</Authors>
+    <Company>crxvsd</Company>
+    <Product>SimpleShowMMR</Product>
+    <AssemblyTitle>SimpleShowMMR - Dota 2 MMR Tracker</AssemblyTitle>
+    <Description>Dota 2 MMR Tracker</Description>
+    <Copyright>Copyright © 2026 crxvsd</Copyright>
+    <Version>2.4.0</Version>
+    <AssemblyVersion>2.4.0.0</AssemblyVersion>
+    <FileVersion>2.4.0.0</FileVersion>
+    <InformationalVersion>2.4.0</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <SatelliteResourceLanguages>en;ru</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SteamKit2" Version="3.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="icon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
