@@ -12,7 +12,8 @@ public record GcMatch(
     long MatchId, long StartTime, int HeroId, bool Won,
     int Lobby, int GameMode, int Duration,
     int PreviousRank,   // рейтинг ДО матча (0 — не рейтинговый / не выдан)
-    int RankChange);    // изменение рейтинга за матч
+    int RankChange,     // изменение рейтинга за матч
+    bool Abandon);      // флаг выхода из игры, который выдаёт сам GC
 
 public record GcResult(uint AccountId, string AccountName, string? NewRefreshToken, List<GcMatch> Matches, string Dump);
 
@@ -242,7 +243,8 @@ static class GcClient
                 list.Add(new GcMatch(
                     Num(m, "match_id"), Num(m, "start_time"), (int)Num(m, "hero_id"),
                     Num(m, "winner") != 0, (int)Num(m, "lobby_type"), (int)Num(m, "game_mode"),
-                    (int)Num(m, "duration"), (int)Num(m, "previous_rank"), (int)Num(m, "rank_change")));
+                    (int)Num(m, "duration"), (int)Num(m, "previous_rank"), (int)Num(m, "rank_change"),
+                    Num(m, "abandon") != 0));
             }
             return new GcResult(accountId, account, newToken, list, dump.ToString());
         }

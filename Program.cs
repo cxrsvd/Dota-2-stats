@@ -19,18 +19,11 @@ static class Program
     [STAThread]
     static void Main()
     {
+        // Velopack: обработка установки/удаления/обновления. Должно быть первым вызовом в Main.
+        Velopack.VelopackApp.Build().Run();
+
         ApplicationConfiguration.Initialize();
-        
-        // Создаем главную форму приложения
-        MainForm mainForm = new MainForm();
-        
-        // Проверяем наличие файла иконки рядом с исполняемым файлом и устанавливаем её для окна
-        if (System.IO.File.Exists("icon.ico"))
-        {
-            mainForm.Icon = new System.Drawing.Icon("icon.ico");
-        }
-        
-        Application.Run(mainForm);
+        Application.Run(new MainForm());
     }
 }
 
@@ -52,6 +45,8 @@ public class MatchEntry
     public DateTime StartUtc { get; set; }
     public int HeroId { get; set; }
     public bool Won { get; set; }
+    /// Покинул игру — приходит прямо от Dota 2 GC, не зависит от OpenDota.
+    public bool Abandon { get; set; }
     public int GameMode { get; set; }
     public int DurationSec { get; set; }
     public int? PrevRating { get; set; }
@@ -70,7 +65,8 @@ public class MatchEntry
     public int? LeaverStatus { get; set; }
 
     [JsonIgnore] public bool HasStats => Kills != null;
-    [JsonIgnore] public bool Left => LeaverStatus >= 2;
+    // Нет статистики (KDA/GPM) — игра не была доиграна, GC/OpenDota пометку не прислали.
+    [JsonIgnore] public bool Left => Abandon || LeaverStatus >= 2 || !HasStats;
     [JsonIgnore] public bool NeedsStats => Kills == null || LeaverStatus == null;
     [JsonIgnore] public int? Delta { get; set; }
     [JsonIgnore] public string Note { get; set; } = "";
@@ -194,7 +190,7 @@ static class Net
     static HttpClient Create()
     {
         var c = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-        c.DefaultRequestHeaders.UserAgent.ParseAdd("DotaMmrTracker/2.4");
+        c.DefaultRequestHeaders.UserAgent.ParseAdd("DotaMmrTracker/2.4.3");
         return c;
     }
 }
@@ -205,23 +201,45 @@ static class OpenDota
 {
     const string Api = "https://api.opendota.com/api";
 
+    /// Причина последней неудачи запроса — показываем в строке статуса вместо общего «нет сети».
+    public static string? LastError { get; private set; }
+
     public record Stats(long MatchId, int Kills, int Deaths, int Assists, int Duration,
                         int Gpm, int Xpm, int LastHits, int HeroDamage, int PartySize, int LeaverStatus);
+
+    // OpenDota стал отдавать match_id строкой (иначе в JS теряется точность), раньше было число.
+    static long ReadId(JsonElement v)
+    {
+        if (v.ValueKind == JsonValueKind.Number) return v.TryGetInt64(out long n) ? n : 0;
+        if (v.ValueKind == JsonValueKind.String && long.TryParse(v.GetString(), out long s)) return s;
+        return 0;
+    }
+
+    static int ReadInt(JsonElement obj, string name)
+    {
+        if (!obj.TryGetProperty(name, out var v)) return 0;
+        if (v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out int n)) return n;
+        if (v.ValueKind == JsonValueKind.String && int.TryParse(v.GetString(), out int s)) return s;
+        return 0;
+    }
 
     /// Просит OpenDota заново подтянуть последние матчи игрока из Steam. Возвращает true, если запрос принят.
     public static async Task<bool> RefreshAsync(uint accountId)
     {
+        LastError = null;
         try
         {
             using var r = await Net.Http.PostAsync($"{Api}/players/{accountId}/refresh", null);
+            if (!r.IsSuccessStatusCode) LastError = $"HTTP {(int)r.StatusCode} при обновлении профиля";
             return r.IsSuccessStatusCode;
         }
-        catch { return false; }
+        catch (Exception ex) { LastError = ex.Message; return false; }
     }
 
     /// Последние матчи игрока со статистикой. null — запрос не удался (сеть/лимиты/закрытый профиль).
     public static async Task<List<Stats>?> RecentAsync(uint accountId, int limit = 40)
     {
+        LastError = null;
         try
         {
             string[] fields =
@@ -237,14 +255,17 @@ static class OpenDota
             var list = new List<Stats>();
             foreach (var m in doc.RootElement.EnumerateArray())
             {
-                int G(string n) => m.TryGetProperty(n, out var v) && v.ValueKind == JsonValueKind.Number ? v.GetInt32() : 0;
                 if (!m.TryGetProperty("match_id", out var idEl)) continue;
-                list.Add(new Stats(idEl.GetInt64(), G("kills"), G("deaths"), G("assists"), G("duration"),
-                                   G("gold_per_min"), G("xp_per_min"), G("last_hits"), G("hero_damage"), G("party_size"), G("leaver_status")));
+                long matchId = ReadId(idEl);
+                if (matchId == 0) continue;
+                list.Add(new Stats(matchId, ReadInt(m, "kills"), ReadInt(m, "deaths"), ReadInt(m, "assists"),
+                                   ReadInt(m, "duration"), ReadInt(m, "gold_per_min"), ReadInt(m, "xp_per_min"),
+                                   ReadInt(m, "last_hits"), ReadInt(m, "hero_damage"), ReadInt(m, "party_size"),
+                                   ReadInt(m, "leaver_status")));
             }
             return list;
         }
-        catch { return null; }
+        catch (Exception ex) { LastError = ex.Message; return null; }
     }
 
     public static async Task<List<HeroInfo>> GetHeroesAsync()
@@ -635,7 +656,7 @@ public class DarkScrollBar : Control
         using (var tp = Gfx.Round(trackRect, 3f))
         using (var tb = new SolidBrush(Color.FromArgb(34, 34, 38)))
             g.FillPath(tb, tp);
-        Color c = drag ? Theme.AccentHi : hover ? Theme.Accent : Color.FromArgb(78, 78, 88);
+        Color c = drag || hover ? Theme.AccentHi : Theme.Accent;
         using var path = Gfx.Round(th.Value, 3f);
         using var br = new SolidBrush(c);
         g.FillPath(br, path);
@@ -1804,7 +1825,7 @@ static class Dialogs
     /// Выбор своего акцентного цвета в стиле приложения. null — отмена.
     public static Color? PickColor(IWin32Window owner, Color current)
     {
-        using var f = MakeForm("Свой цвет", 290);
+        using var f = MakeForm("Свой цвет", 330);
         var sv = new SvPicker { Bounds = new Rectangle(16, 16, 240, 170) };
         var bar = new HueBar { Bounds = new Rectangle(266, 16, 22, 170) };
         var preview = new RoundedPanel { Bounds = new Rectangle(300, 16, 104, 62), Radius = 10 };
@@ -1815,11 +1836,11 @@ static class Dialogs
         hex.MaxLength = 7;
         var warn = new Label
         {
-            Left = 16, Top = 198, Width = 388, Height = 20,
+            Left = 16, Top = 196, Width = 388, Height = 44,
             ForeColor = Theme.Warn, Text = "Слишком тёмный цвет — на тёмном фоне его не будет видно"
         };
-        var ok = new FancyButton { Text = "Применить", Left = 212, Top = 240, Width = 100, Height = 32, Primary = true, DialogResult = DialogResult.OK };
-        var cancel = new FancyButton { Text = "Отмена", Left = 320, Top = 240, Width = 84, Height = 32, DialogResult = DialogResult.Cancel };
+        var ok = new FancyButton { Text = "Применить", Left = 212, Top = 280, Width = 100, Height = 32, Primary = true, DialogResult = DialogResult.OK };
+        var cancel = new FancyButton { Text = "Отмена", Left = 320, Top = 280, Width = 84, Height = 32, DialogResult = DialogResult.Cancel };
         f.Controls.AddRange(new Control[] { sv, bar, preview, hexLbl, hex, warn, ok, cancel });
         f.AcceptButton = ok; f.CancelButton = cancel;
 
@@ -1908,6 +1929,15 @@ public class MainForm : Form, IMessageFilter
     readonly StatTile tileGpm = new() { Title = "СРЕДНИЙ GPM" };
     readonly StatTile tileXpm = new() { Title = "СРЕДНИЙ XPM" };
     int viewIndex; // 0: История матчей, 1: Статистика игр
+
+    // Обновления через Velopack (GitHub Releases). Публичный репозиторий с релизами.
+    const string RepoUrl = "https://github.com/cxrsvd/Dota-2-stats";
+    Velopack.UpdateManager? updater;
+    Velopack.UpdateInfo? pendingUpdate;
+    bool checkingUpdate;
+    readonly FancyButton updateBtn = new() { Primary = true, Text = "Обновить" };
+    readonly Panel updateHost = new() { Dock = DockStyle.Right, Width = 220, Padding = new Padding(0, 5, 0, 5), BackColor = Theme.Bg, Visible = false };
+    readonly WinTimer updateTimer = new() { Interval = 6 * 60 * 60 * 1000 };
     bool settingsOpen;
     const int SettingsFullHeight = 200;
     static readonly Color[] AccentPresets =
@@ -1943,10 +1973,11 @@ public class MainForm : Form, IMessageFilter
         ForeColor = Theme.Text;
         Opacity = 0;
 
-        // Установка иконки приложения, если файл icon.ico присутствует в корневой папке
-        if (File.Exists("icon.ico"))
+        // Иконка лежит рядом с exe (после установки Velopack рабочая папка может отличаться, поэтому BaseDirectory)
+        string iconPath = Path.Combine(AppContext.BaseDirectory, "icon.ico");
+        if (File.Exists(iconPath))
         {
-            Icon = new Icon("icon.ico");
+            try { Icon = new Icon(iconPath); } catch { }
         }
 
         BuildLayout();
@@ -1960,6 +1991,9 @@ public class MainForm : Form, IMessageFilter
         Deactivate += (_, _) => CloseMenu();
         menuBtn.Click += (_, _) => ToggleMenu();
         viewMenu.ItemChosen += SetView;
+        updateBtn.Click += (_, _) => ApplyUpdate();
+        updateTimer.Tick += (_, _) => { _ = CheckUpdatesAsync(); };
+        updateTimer.Start();
         stratzBtn.Click += (_, _) => OpenProfile("https://stratz.com/players/");
         dotabuffBtn.Click += (_, _) => OpenProfile("https://www.dotabuff.com/players/");
 
@@ -2018,6 +2052,7 @@ public class MainForm : Form, IMessageFilter
             dotaState = first;
             wasDotaRunning = first == true;
             SetDotaState(first);
+            _ = CheckUpdatesAsync();
             await HeroData.InitAsync();
             Rebind();
             _ = EnrichAsync(false);
@@ -2221,7 +2256,7 @@ public class MainForm : Form, IMessageFilter
 
         var footer = new Label
         {
-            Text = "gl hf  ·  v2.4",
+            Text = "gl hf  ·  v2.4.3",
             Dock = DockStyle.Bottom,
             Height = 36,
             TextAlign = ContentAlignment.MiddleCenter,
@@ -2245,6 +2280,9 @@ public class MainForm : Form, IMessageFilter
 
         mainFrame.Padding = new Padding(28, 22, 28, 16);
         var header = new Panel { Dock = DockStyle.Top, Height = 50, BackColor = Theme.Bg };
+        updateBtn.Dock = DockStyle.Fill;
+        updateHost.Controls.Add(updateBtn);
+        header.Controls.Add(updateHost);
         menuBtn.Bounds = new Rectangle(0, 1, 40, 40);
         header.Controls.Add(menuBtn);
         header.Controls.Add(titleLbl);
@@ -2360,7 +2398,7 @@ public class MainForm : Form, IMessageFilter
         {
             ("time", "  ВРЕМЯ", 95), ("hero", "ГЕРОЙ", 215), ("res", "ИТОГ", 125),
             ("kda", "K / D / A", 105), ("dur", "ВРЕМЯ ИГРЫ", 90), ("gpm", "GPM / XPM", 105),
-            ("rating", "РЕЙТИНГ", 75), ("delta", "Δ", 65)
+            ("rating", "РЕЙТИНГ", 75), ("delta", "", 65)
         })
         {
             int i = grid.Columns.Add(name, header);
@@ -2492,6 +2530,42 @@ public class MainForm : Form, IMessageFilter
         if (await FetchDotaPresenceAsync() != true) await SyncAsync(false);
     }
 
+    // ── Обновления (Velopack) ──
+
+    async Task CheckUpdatesAsync()
+    {
+        if (checkingUpdate || pendingUpdate != null || RepoUrl.Contains("YOUR_")) return;
+        checkingUpdate = true;
+        try
+        {
+            updater ??= new Velopack.UpdateManager(new Velopack.Sources.GithubSource(RepoUrl, null, false));
+            if (!updater.IsInstalled) return; // запущено не из установщика (отладка / портативный exe)
+            var info = await updater.CheckForUpdatesAsync();
+            if (info == null) return;
+            string ver = info.TargetFullRelease.Version.ToString();
+            SetStatus($"Найдено обновление {ver}, загружаю…");
+            await updater.DownloadUpdatesAsync(info);
+            pendingUpdate = info;
+            updateBtn.Text = $"Обновить до v{ver}";
+            updateHost.Visible = true;
+            SetStatus($"Обновление {ver} загружено — нажмите кнопку вверху справа");
+        }
+           catch (Exception ex) { SetStatus("Проверка обновлений: " + ex.Message); }
+        finally { checkingUpdate = false; }
+    }
+
+    void ApplyUpdate()
+    {
+        if (updater == null || pendingUpdate == null) return;
+        if (busy)
+        {
+            SetStatus("Дождитесь окончания синхронизации и нажмите «Обновить» ещё раз");
+            return;
+        }
+        SaveAll();
+        updater.ApplyUpdatesAndRestart(pendingUpdate); // приложение закроется, обновится и запустится снова
+    }
+
     // ── Ссылки на профиль ──
 
     void OpenProfile(string baseUrl)
@@ -2594,7 +2668,7 @@ public class MainForm : Form, IMessageFilter
             }
             settings.AccountId = res.AccountId;
             Storage.WriteText("gc_dump.txt", res.Dump);
-            int added = Import(res);
+            int added = Import(res, out int abandonFixes);
             SaveAll();
             UpdateAccountInfo();
             Rebind();
@@ -2609,7 +2683,8 @@ public class MainForm : Form, IMessageFilter
             else
             {
                 int pending = PendingStats().Count;
-                string tail = pending > 0 ? $" · статистика OpenDota для {pending} матч. подтянется позже" : "";
+                string tail = abandonFixes > 0 ? $" · обновлено пометок «покинута»: {abandonFixes}" : "";
+                if (pending > 0) tail += $" · статистика OpenDota для {pending} матч. подтянется позже";
                 SetStatus($"Синхронизировано в {DateTime.Now:HH:mm:ss}. Новых матчей: {added}{tail}");
             }
         }
@@ -2644,20 +2719,33 @@ public class MainForm : Form, IMessageFilter
         }
     }
 
-    int Import(GcResult res)
+    int Import(GcResult res, out int abandonFixes)
     {
-        var known = data.Matches.Select(m => m.MatchId).ToHashSet();
+        var known = data.Matches.GroupBy(m => m.MatchId).ToDictionary(g => g.Key, g => g.First());
         int added = 0;
+        abandonFixes = 0;
         foreach (var g in res.Matches)
         {
             bool ranked = g.Lobby == 7 || g.PreviousRank > 0;
-            if (!ranked || known.Contains(g.MatchId)) continue;
+            if (!ranked) continue;
+            // GC — авторитетный источник флага abandon: обновляем и уже сохранённые матчи,
+            // иначе старые игры, у которых OpenDota вернул leaver_status = 0, останутся без пометки.
+            if (known.TryGetValue(g.MatchId, out var old))
+            {
+                if (old.Abandon != g.Abandon)
+                {
+                    old.Abandon = g.Abandon;
+                    abandonFixes++;
+                }
+                continue;
+            }
             data.Matches.Add(new MatchEntry
             {
                 MatchId = g.MatchId,
                 StartUtc = DateTimeOffset.FromUnixTimeSeconds(g.StartTime).UtcDateTime,
                 HeroId = g.HeroId,
                 Won = g.Won,
+                Abandon = g.Abandon,
                 GameMode = g.GameMode,
                 DurationSec = g.Duration,
                 PrevRating = g.PreviousRank > 0 ? g.PreviousRank : null,
@@ -2710,7 +2798,7 @@ public class MainForm : Form, IMessageFilter
                 if (recent != null)
                 {
                     reached = true;
-                    var map = recent.ToDictionary(s => s.MatchId);
+                    var map = recent.GroupBy(s => s.MatchId).ToDictionary(g => g.Key, g => g.First());
                     foreach (var m in missing)
                     {
                         if (!map.TryGetValue(m.MatchId, out var s)) continue;
@@ -2738,14 +2826,18 @@ public class MainForm : Form, IMessageFilter
             }
             int left = PendingStats().Count;
             if (!reached)
-                SetStatus("Не удалось связаться с OpenDota (сеть или лимит запросов)");
+                SetStatus("Не удалось загрузить статистику из OpenDota" +
+                          (OpenDota.LastError == null ? " (сеть или лимит запросов)" : ": " + OpenDota.LastError));
             else if (left > 0)
                 SetStatus($"Статистика загружена для {filled}, ещё {left} матч. OpenDota пока не отдал " +
                           "(проверьте включена ли общедоступная история матчей в настройках Dota 2)");
             else if (filled > 0)
                 SetStatus($"Статистика для {filled} матчей загружена");
         }
-        catch { }
+        catch (Exception ex)
+        {
+            SetStatus("Ошибка загрузки статистики: " + ex.Message);
+        }
         finally
         {
             enriching = false;
@@ -2799,7 +2891,7 @@ public class MainForm : Form, IMessageFilter
             int i = grid.Rows.Add(
                 Msk.FromUtc(m.StartUtc).ToString("dd.MM HH:mm"),
                 HeroData.Name(m.HeroId),
-                m.Left ? "⚠ Покинута" : m.Won ? "▲ Победа" : "▼ Поражение",
+                m.Left ? "− Покинуто" : m.Won ? "▲ Победа" : "▼ Поражение",
                 m.HasStats ? $"{m.Kills} / {m.Deaths} / {m.Assists}" : "—",
                 FmtDuration(m.DurationSec),
                 m.Gpm != null ? $"{m.Gpm} / {m.Xpm}" : "—",
