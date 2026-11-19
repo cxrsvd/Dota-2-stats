@@ -65,8 +65,9 @@ public class MatchEntry
     public int? LeaverStatus { get; set; }
 
     [JsonIgnore] public bool HasStats => Kills != null;
-    // Нет статистики (KDA/GPM) — игра не была доиграна, GC/OpenDota пометку не прислали.
-    [JsonIgnore] public bool Left => Abandon || LeaverStatus >= 2 || !HasStats;
+    // Короткая игра без статистики — почти наверняка выход, но обычные матчи без KDA/GPM
+    // (OpenDota ещё не подтянул данные) помечать как покинутые нельзя.
+    [JsonIgnore] public bool Left => Abandon || LeaverStatus >= 2 || (!HasStats && DurationSec < 600);
     [JsonIgnore] public bool NeedsStats => Kills == null || LeaverStatus == null;
     [JsonIgnore] public int? Delta { get; set; }
     [JsonIgnore] public string Note { get; set; } = "";
@@ -190,7 +191,7 @@ static class Net
     static HttpClient Create()
     {
         var c = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-        c.DefaultRequestHeaders.UserAgent.ParseAdd("DotaMmrTracker/2.4.3");
+        c.DefaultRequestHeaders.UserAgent.ParseAdd("DotaMmrTracker/2.4.4");
         return c;
     }
 }
@@ -1144,7 +1145,7 @@ public class StatCard : Control
     readonly Font titleFont = new("Segoe UI Semibold", 8F);
     readonly Font valueFont = new("Segoe UI Semibold", 22F);
     readonly Font subFont = new("Segoe UI", 8.5F);
-    Func<double, string> fmt = d => Math.Round(d).ToString("0");
+    Func<double, string> fmt = d => Math.Round(d, MidpointRounding.AwayFromZero).ToString("0");
     string? staticText = "—";
     Color valueColor = Theme.Muted;
     double vStart, vEnd, vCur;
@@ -2055,7 +2056,7 @@ public class MainForm : Form, IMessageFilter
             _ = CheckUpdatesAsync();
             await HeroData.InitAsync();
             Rebind();
-            _ = EnrichAsync(false);
+            _ = EnrichAsync(false, deep: true); // на старте добираем статистику и по старым матчам
             if (settings.TokenEnc != "" && !wasDotaRunning) await SyncAsync(false);
         };
     }
@@ -2256,7 +2257,7 @@ public class MainForm : Form, IMessageFilter
 
         var footer = new Label
         {
-            Text = "gl hf  ·  v2.4.3",
+            Text = "gl hf  ·  v2.4.4",
             Dock = DockStyle.Bottom,
             Height = 36,
             TextAlign = ContentAlignment.MiddleCenter,
@@ -2660,7 +2661,9 @@ public class MainForm : Form, IMessageFilter
         try
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
-            var res = await GcClient.FetchAsync(username, password, token, AskCodeAsync, SetStatus, cts.Token);
+            // При первом входе (нет сохранённой сессии) забираем максимум истории; при обычной синхронизации — последние 60 матчей.
+            var res = await GcClient.FetchAsync(username, password, token, AskCodeAsync, SetStatus, cts.Token,
+                token == null ? 50 : 3);
             if (res.NewRefreshToken != null)
             {
                 settings.TokenEnc = Storage.Protect(res.NewRefreshToken);
@@ -2682,7 +2685,7 @@ public class MainForm : Form, IMessageFilter
                 SetStatus($"GC вернул матчи ({res.Matches.Count}), но без рейтинга. Диагностика: {dumpPath}");
             else
             {
-                int pending = PendingStats().Count;
+                int pending = PendingStatsAll().Count;
                 string tail = abandonFixes > 0 ? $" · обновлено пометок «покинута»: {abandonFixes}" : "";
                 if (pending > 0) tail += $" · статистика OpenDota для {pending} матч. подтянется позже";
                 SetStatus($"Синхронизировано в {DateTime.Now:HH:mm:ss}. Новых матчей: {added}{tail}");
@@ -2760,16 +2763,22 @@ public class MainForm : Form, IMessageFilter
     List<MatchEntry> PendingStats() =>
         data.Matches.OrderByDescending(m => m.StartUtc).Take(40).Where(m => m.NeedsStats).ToList();
 
+    /// Все матчи без статистики, а не только последние 40 — для глубокой подгрузки старых игр.
+    List<MatchEntry> PendingStatsAll() => data.Matches.Where(m => m.NeedsStats).ToList();
+
     /// Подтягивает K/D/A, GPM/XPM и т.д. из OpenDota для матчей без статистики.
     /// refreshFirst = true (кнопка «Синхронизировать» и автосинхронизация): сначала просим OpenDota
     /// обновить профиль, затем несколько раз опрашиваем API, пока матчи не появятся.
-    async Task EnrichAsync(bool refreshFirst)
+    async Task EnrichAsync(bool refreshFirst, bool deep = false)
     {
         if (settings.AccountId == 0) return;
         // если фоновая подгрузка ещё идёт, дождёмся её, чтобы синхронизация точно отправила refresh
         while (enriching && refreshFirst) await Task.Delay(300);
         if (enriching) return;
-        if (!refreshFirst && PendingStats().Count == 0) return;
+
+        bool full = refreshFirst || deep;
+        List<MatchEntry> Missing() => full ? PendingStatsAll() : PendingStats();
+        if (Missing().Count == 0) return;
 
         enriching = true;
         try
@@ -2779,7 +2788,7 @@ public class MainForm : Form, IMessageFilter
                 SetStatus("Запрашиваю обновление у OpenDota…");
                 bool accepted = await OpenDota.RefreshAsync(settings.AccountId);
                 if (!accepted) SetStatus("OpenDota не принял запрос обновления, пробую получить данные как есть…");
-                if (PendingStats().Count == 0) return;
+                if (Missing().Count == 0) return;
                 await Task.Delay(3000); // OpenDota нужно время, чтобы забрать матчи из Steam
             }
 
@@ -2788,13 +2797,13 @@ public class MainForm : Form, IMessageFilter
             int attempts = refreshFirst ? 4 : 1;
             for (int attempt = 1; attempt <= attempts; attempt++)
             {
-                var missing = PendingStats();
+                var missing = Missing();
                 if (missing.Count == 0) break;
 
                 SetStatus(attempts > 1
                     ? $"Загружаю статистику из OpenDota ({attempt}/{attempts})…"
                     : "Загружаю статистику матчей из OpenDota…");
-                var recent = await OpenDota.RecentAsync(settings.AccountId);
+                var recent = await OpenDota.RecentAsync(settings.AccountId, full ? 1000 : 40);
                 if (recent != null)
                 {
                     reached = true;
@@ -2815,7 +2824,7 @@ public class MainForm : Form, IMessageFilter
                         filled++;
                     }
                 }
-                if (PendingStats().Count == 0 || attempt == attempts) break;
+                if (Missing().Count == 0 || attempt == attempts) break;
                 await Task.Delay(6000);
             }
 
@@ -2824,7 +2833,7 @@ public class MainForm : Form, IMessageFilter
                 SaveAll();
                 Rebind();
             }
-            int left = PendingStats().Count;
+            int left = Missing().Count;
             if (!reached)
                 SetStatus("Не удалось загрузить статистику из OpenDota" +
                           (OpenDota.LastError == null ? " (сеть или лимит запросов)" : ": " + OpenDota.LastError));
@@ -2872,9 +2881,12 @@ public class MainForm : Form, IMessageFilter
 
     static string Fmt(int? d) => d == null ? "" : (d > 0 ? $"+{d}" : d.ToString()!);
 
+    /// Обычное «половина вверх»: Math.Round по умолчанию округляет .5 к чётному.
+    static string RoundInt(double v) => Math.Round(v, MidpointRounding.AwayFromZero).ToString("0");
+
     static string Sign(double d)
     {
-        int v = (int)Math.Round(d);
+        int v = (int)Math.Round(d, MidpointRounding.AwayFromZero);
         return v > 0 ? $"+{v}" : v.ToString();
     }
 
@@ -2971,7 +2983,7 @@ public class MainForm : Form, IMessageFilter
             int lastDelta = last.Delta ?? 0;
             string lastSub = HeroData.Name(last.HeroId) +
                 (last.HasStats ? $" · {last.Kills}/{last.Deaths}/{last.Assists}" : "");
-            cardRating.SetValue(cur, d => Math.Round(d).ToString("0"), Theme.Text, $"игр: {all.Count}");
+            cardRating.SetValue(cur, RoundInt, Theme.Text, $"игр: {all.Count}");
             cardLast.SetValue(lastDelta, Sign,
                 lastDelta > 0 ? Theme.Good : lastDelta < 0 ? Theme.Bad : Theme.Text,
                 lastSub);
@@ -2987,12 +2999,13 @@ public class MainForm : Form, IMessageFilter
             cardPeriod.SetText("—", Theme.Muted, "");
         }
         string periodNameSub = GetPeriodName();
-        cardWin.SetValue(wrPeriod, d => $"{Math.Round(d):0}%", wrPeriod >= 50 ? Theme.Good : Theme.Bad,
+        cardWin.SetValue(wrPeriod, d => $"{RoundInt(d)}%", wrPeriod >= 50 ? Theme.Good : Theme.Bad,
             $"{winsPeriod} поб. · {lossesPeriod} пор. · {periodNameSub}");
     }
 
     /// Экран «Статистика игр»: лучший герой по винрейту и средние показатели за выбранный период.
-    /// Лучший герой — среди тех, кого играли минимум 2 раза (если таких нет — среди всех).
+    /// Минимум игр на герое зависит от периода: день/неделя — 2, месяц — 5, всё время — 10.
+    /// Если таких героев нет — считаем среди всех.
     void UpdateStatsView()
     {
         var pm = GetFilteredMatchesForPeriod();
@@ -3004,12 +3017,13 @@ public class MainForm : Form, IMessageFilter
             tileBest.Set("—", Theme.Muted, $"нет игр · {period}");
         else
         {
-            var pool = groups.Where(g => g.Games >= 2).ToList();
+            int minGames = currentPeriodIndex switch { 2 => 5, 3 => 10, _ => 2 };
+            var pool = groups.Where(g => g.Games >= minGames).ToList();
             if (pool.Count == 0) pool = groups;
             var best = pool.OrderByDescending(g => (double)g.Wins / g.Games).ThenByDescending(g => g.Games).First();
             double wr = 100.0 * best.Wins / best.Games;
             tileBest.Set(HeroData.Name(best.Id), wr >= 50 ? Theme.Good : Theme.Bad,
-                $"винрейт {Math.Round(wr):0}% · {best.Wins} поб. из {best.Games} игр · {period}", best.Id);
+                $"винрейт {RoundInt(wr)}% · {best.Wins} поб. из {best.Games} игр · {period}", best.Id);
         }
 
         var st = pm.Where(m => m.HasStats).ToList();
@@ -3024,8 +3038,8 @@ public class MainForm : Form, IMessageFilter
         double k = st.Average(m => m.Kills ?? 0);
         double d = st.Average(m => m.Deaths ?? 0);
         double a = st.Average(m => m.Assists ?? 0);
-        tileKda.Set($"{k:0.0} / {d:0.0} / {a:0.0}", Theme.Text,
-            $"KDA {(k + a) / Math.Max(1.0, d):0.00} · игр: {st.Count} · {period}");
+        tileKda.Set($"{RoundInt(k)} / {RoundInt(d)} / {RoundInt(a)}", Theme.Text,
+            $"KDA {RoundInt((k + a) / Math.Max(1.0, d))} · игр: {st.Count} · {period}");
         var gp = st.Where(m => m.Gpm != null).ToList();
         if (gp.Count == 0)
         {
@@ -3033,8 +3047,8 @@ public class MainForm : Form, IMessageFilter
             tileXpm.Set("—", Theme.Muted, $"нет данных · {period}");
             return;
         }
-        tileGpm.Set($"{Math.Round(gp.Average(m => m.Gpm ?? 0)):0}", Theme.Text, $"игр: {gp.Count} · {period}");
-        tileXpm.Set($"{Math.Round(gp.Average(m => m.Xpm ?? 0)):0}", Theme.Text, $"игр: {gp.Count} · {period}");
+        tileGpm.Set(RoundInt(gp.Average(m => m.Gpm ?? 0)), Theme.Text, $"игр: {gp.Count} · {period}");
+        tileXpm.Set(RoundInt(gp.Average(m => m.Xpm ?? 0)), Theme.Text, $"игр: {gp.Count} · {period}");
     }
 
     void UpdateAccountInfo()

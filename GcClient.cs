@@ -103,7 +103,8 @@ static class GcClient
 
     public static async Task<GcResult> FetchAsync(
         string username, string? password, string? refreshToken,
-        Func<string, Task<string>> askCode, Action<string> log, CancellationToken ct)
+        Func<string, Task<string>> askCode, Action<string> log, CancellationToken ct,
+        int maxPages = 3)
     {
         uint historyReqId = FindMsg(false);
         uint historyRespId = FindMsg(true);
@@ -204,48 +205,66 @@ static class GcClient
             }
             await Wait(welcome.Task, 1, "ответ Dota 2 GC (возможно, Dota сейчас запущена)", ct);
 
-            // история матчей
-            log("Запрос истории матчей…");
-            ClientGCMsgProtobuf<DotaGC.CMsgDOTAGetPlayerMatchHistoryResponse> resp = null!;
-            for (int attempt = 1; attempt <= 3; attempt++)
-            {
-                history = new TaskCompletionSource<IPacketGCMsg>();
-
-                var req = new ClientGCMsgProtobuf<DotaGC.CMsgDOTAGetPlayerMatchHistory>(historyReqId);
-                req.Body.account_id = accountId;
-                req.Body.matches_requested = 20;   // размер страницы GC; больше — GC отвечает пустым списком
-                SetProp(req.Body, "request_id", attempt);
-                SetProp(req.Body, "start_at_match_id", 0);
-                SetProp(req.Body, "include_practice_matches", true);
-                SetProp(req.Body, "include_custom_games", true);
-                SetProp(req.Body, "include_event_games", true);
-                gc.Send(req, DotaAppId);
-
-                var pkt = await Wait(history.Task, 25, "история матчей от GC", ct);
-                resp = new ClientGCMsgProtobuf<DotaGC.CMsgDOTAGetPlayerMatchHistoryResponse>(pkt);
-                if (resp.Body.matches.Count > 0) break;
-
-                log($"GC вернул пустую историю, повтор {attempt}/3…");
-                await Task.Delay(4000, ct);
-            }
-
+            // История матчей. GC отдаёт не больше 20 за раз, поэтому листаем страницы
+            // от новых к старым через start_at_match_id и собираем всё в один список.
+            const int PageSize = 20;
             var list = new List<GcMatch>();
+            var seen = new HashSet<long>();
             var dump = new System.Text.StringBuilder();
             dump.AppendLine($"account_id={accountId}, request msg id={historyReqId}, response msg id={historyRespId}");
             dump.AppendLine("enum names with 'History': " +
                 string.Join(", ", Enum.GetNames(typeof(DotaGC.EDOTAGCMsg)).Where(x => x.Contains("History"))));
-            dump.AppendLine("response: " + DumpOf(resp.Body));
-            dump.AppendLine($"matches in response: {resp.Body.matches.Count}");
-            int n = 0;
-            foreach (var m in resp.Body.matches)
+
+            ulong startAt = 0;
+            for (int page = 1; page <= maxPages; page++)
             {
-                if (n++ < 3) dump.AppendLine(DumpOf(m));
-                list.Add(new GcMatch(
-                    Num(m, "match_id"), Num(m, "start_time"), (int)Num(m, "hero_id"),
-                    Num(m, "winner") != 0, (int)Num(m, "lobby_type"), (int)Num(m, "game_mode"),
-                    (int)Num(m, "duration"), (int)Num(m, "previous_rank"), (int)Num(m, "rank_change"),
-                    Num(m, "abandon") != 0));
+                ClientGCMsgProtobuf<DotaGC.CMsgDOTAGetPlayerMatchHistoryResponse>? resp = null;
+                for (int attempt = 1; attempt <= 3; attempt++)
+                {
+                    history = new TaskCompletionSource<IPacketGCMsg>();
+
+                    var req = new ClientGCMsgProtobuf<DotaGC.CMsgDOTAGetPlayerMatchHistory>(historyReqId);
+                    req.Body.account_id = accountId;
+                    req.Body.matches_requested = PageSize;   // больше GC не отдаёт — листаем страницами
+                    SetProp(req.Body, "request_id", page * 100 + attempt);
+                    SetProp(req.Body, "start_at_match_id", startAt);
+                    SetProp(req.Body, "include_practice_matches", true);
+                    SetProp(req.Body, "include_custom_games", true);
+                    SetProp(req.Body, "include_event_games", true);
+                    gc.Send(req, DotaAppId);
+
+                    var pkt = await Wait(history.Task, 25, "история матчей от GC", ct);
+                    var parsed = new ClientGCMsgProtobuf<DotaGC.CMsgDOTAGetPlayerMatchHistoryResponse>(pkt);
+                    if (parsed.Body.matches.Count > 0) { resp = parsed; break; }
+
+                    log($"GC вернул пустую страницу {page}, повтор {attempt}/3…");
+                    await Task.Delay(4000, ct);
+                }
+                if (resp == null) break;
+
+                dump.AppendLine($"page {page}: start_at={startAt}, count={resp.Body.matches.Count}, response: {DumpOf(resp.Body)}");
+                int n = 0, addedOnPage = 0;
+                foreach (var m in resp.Body.matches)
+                {
+                    if (page == 1 && n++ < 3) dump.AppendLine(DumpOf(m));
+                    var match = new GcMatch(
+                        Num(m, "match_id"), Num(m, "start_time"), (int)Num(m, "hero_id"),
+                        Num(m, "winner") != 0, (int)Num(m, "lobby_type"), (int)Num(m, "game_mode"),
+                        (int)Num(m, "duration"), (int)Num(m, "previous_rank"), (int)Num(m, "rank_change"),
+                        Num(m, "abandon") != 0);
+                    if (seen.Add(match.MatchId)) { list.Add(match); addedOnPage++; }
+                }
+                log($"История из GC: страница {page}, матчей {resp.Body.matches.Count}, всего {list.Count}");
+
+                // Короткая страница не значит конец истории: GC иногда отдаёт меньше 20,
+                // поэтому продолжаем, пока приходят новые match_id.
+                if (addedOnPage == 0) break;
+                long oldest = Num(resp.Body.matches[^1], "match_id");
+                // GC игнорирует start_at_match_id или история закончилась — дальше листать нечего
+                if (oldest <= 0 || (ulong)oldest == startAt) break;
+                startAt = (ulong)oldest;
             }
+            dump.AppendLine($"pages requested: {maxPages}, matches collected: {list.Count}");
             return new GcResult(accountId, account, newToken, list, dump.ToString());
         }
         finally
