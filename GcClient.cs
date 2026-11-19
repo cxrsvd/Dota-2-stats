@@ -17,6 +17,9 @@ public record GcMatch(
 
 public record GcResult(uint AccountId, string AccountName, string? NewRefreshToken, List<GcMatch> Matches, string Dump);
 
+/// Результат входа по QR-коду: те же данные, что даёт вход по логину/паролю.
+public record QrAuth(string User, string RefreshToken);
+
 public class TokenRejectedException : Exception
 {
     public TokenRejectedException() : base("Сохранённая сессия Steam больше недействительна.") { }
@@ -100,6 +103,58 @@ static class GcClient
         string.Join(", ", o.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance)
             .Where(p => p.GetIndexParameters().Length == 0)
             .Select(p => { try { return $"{p.Name}={p.GetValue(o)}"; } catch { return p.Name + "=?"; } }));
+
+    /// Вход через QR: показываем ChallengeURL и ждём подтверждения в мобильном приложении Steam.
+    public static async Task<QrAuth> LoginViaQrAsync(
+        Action<string> showQr, Action hideQr, Action<string> log, CancellationToken ct)
+    {
+        var steam = new SteamClient();
+        var mgr = new CallbackManager(steam);
+        var connected = new TaskCompletionSource();
+        bool stop = false, finishing = false;
+
+        mgr.Subscribe<SteamClient.ConnectedCallback>(_ => connected.TrySetResult());
+        mgr.Subscribe<SteamClient.DisconnectedCallback>(_ =>
+        {
+            if (finishing) return;
+            connected.TrySetException(new Exception("Соединение со Steam разорвано."));
+        });
+
+        var pump = Task.Run(() =>
+        {
+            while (!stop) mgr.RunWaitCallbacks(TimeSpan.FromMilliseconds(250));
+        });
+
+        try
+        {
+            log("Подключение к Steam…");
+            steam.Connect();
+            await Wait(connected.Task, 20, "подключение к Steam", ct);
+
+            log("Ожидание сканирования QR-кода…");
+            var session = await steam.Authentication.BeginAuthSessionViaQRAsync(new AuthSessionDetails
+            {
+                DeviceFriendlyName = "SimpleShowMMR"
+            });
+            session.ChallengeURLChanged = () =>
+            {
+                if (!ct.IsCancellationRequested) showQr(session.ChallengeURL);
+            };
+            showQr(session.ChallengeURL);
+
+            var poll = await session.PollingWaitForResultAsync(ct);
+            log("Вход подтверждён в приложении Steam.");
+            return new QrAuth(poll.AccountName, poll.RefreshToken);
+        }
+        finally
+        {
+            finishing = true;
+            try { steam.Disconnect(); } catch { }
+            stop = true;
+            try { await pump; } catch { }
+            hideQr();
+        }
+    }
 
     public static async Task<GcResult> FetchAsync(
         string username, string? password, string? refreshToken,

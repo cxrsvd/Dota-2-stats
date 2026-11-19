@@ -10,6 +10,8 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Xml.Linq;
+using ZXing;
+using ZXing.QrCode;
 using WinTimer = System.Windows.Forms.Timer;
 
 namespace DotaMmrTracker;
@@ -29,14 +31,26 @@ static class Program
 
 // ───────────────────────────── Модели ─────────────────────────────
 
+/// Глобальные настройки приложения. Поля логина оставлены только для миграции со старых версий.
 public class Settings
 {
+    public uint ActiveAccountId { get; set; }
+    public bool AutoSync { get; set; } = true;
+    public string AccentHex { get; set; } = "";
     public string Username { get; set; } = "";
     public string PersonaName { get; set; } = "";
     public string TokenEnc { get; set; } = "";
     public uint AccountId { get; set; }
-    public bool AutoSync { get; set; } = true;
-    public string AccentHex { get; set; } = "";
+}
+
+/// Всё, что относится к одному аккаунту: сессия и его личная история матчей.
+public class AccountData
+{
+    public uint AccountId { get; set; }
+    public string Username { get; set; } = "";
+    public string PersonaName { get; set; } = "";
+    public string TokenEnc { get; set; } = "";
+    public List<MatchEntry> Matches { get; set; } = new();
 }
 
 public class MatchEntry
@@ -151,8 +165,8 @@ static class Storage
 
     public static void Save<T>(string name, T obj)
     {
-        Directory.CreateDirectory(Dir);
         string path = Path.Combine(Dir, name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         string tmp = path + ".tmp";
         File.WriteAllText(tmp, JsonSerializer.Serialize(obj, Opt));
         if (File.Exists(path)) File.Copy(path, path + ".bak", true);
@@ -161,8 +175,9 @@ static class Storage
 
     public static void WriteText(string name, string text)
     {
-        Directory.CreateDirectory(Dir);
-        File.WriteAllText(Path.Combine(Dir, name), text);
+        string path = Path.Combine(Dir, name);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, text);
     }
 
     public static string Protect(string s) =>
@@ -191,7 +206,7 @@ static class Net
     static HttpClient Create()
     {
         var c = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
-        c.DefaultRequestHeaders.UserAgent.ParseAdd("DotaMmrTracker/2.4.4");
+        c.DefaultRequestHeaders.UserAgent.ParseAdd("DotaMmrTracker/2.4.5");
         return c;
     }
 }
@@ -1888,6 +1903,141 @@ static class Dialogs
         if (f.ShowDialog(owner) != DialogResult.OK) return null;
         return color;
     }
+
+    /// Выбор способа входа, когда сохранённой сессии нет.
+    public static LoginChoice AskLoginMethod(IWin32Window owner)
+    {
+        using var f = MakeForm("Вход в Steam", 196);
+        var lbl = new Label
+        {
+            Left = 16, Top = 14, Width = 388, Height = 30,
+            ForeColor = Theme.Muted, Text = "Как войти в Steam?"
+        };
+        var qr = new FancyButton { Text = "Войти по QR-коду", Left = 16, Top = 58, Width = 388, Height = 38, Primary = true, DialogResult = DialogResult.Yes };
+        var pass = new FancyButton { Text = "Логин и пароль", Left = 16, Top = 104, Width = 388, Height = 38, DialogResult = DialogResult.No };
+        var cancel = new FancyButton { Text = "Отмена", Left = 16, Top = 150, Width = 388, Height = 32, DialogResult = DialogResult.Cancel };
+        f.Controls.AddRange(new Control[] { lbl, qr, pass, cancel });
+        f.CancelButton = cancel;
+        return f.ShowDialog(owner) switch
+        {
+            DialogResult.Yes => LoginChoice.Qr,
+            DialogResult.No => LoginChoice.Password,
+            _ => LoginChoice.Cancel
+        };
+    }
+
+    /// Список аккаунтов: выбираем активный или добавляем новый.
+    public static AccountAction ManageAccounts(IWin32Window owner, List<AccountData> list, uint activeId)
+    {
+        int visible = Math.Min(list.Count, 14);
+        int maxH = Math.Max(320, (Screen.PrimaryScreen?.WorkingArea.Height ?? 800) - 80);
+        int h = Math.Min(maxH, 120 + visible * 42 + (list.Count > visible ? 24 : 0));
+        using var f = MakeForm("Аккаунты", h);
+        if (list.Count > visible)
+            f.Controls.Add(new Label { Left = 16, Top = h - 30, Width = 388, Height = 18,
+                ForeColor = Theme.Muted, Text = $"и ещё {list.Count - visible} аккаунтов" });
+        var lbl = new Label
+        {
+            Left = 16, Top = 12, Width = 388, Height = 18,
+            ForeColor = Theme.Muted, Text = "Выберите аккаунт — история хранится отдельно"
+        };
+        f.Controls.Add(lbl);
+        AccountAction result = new(AccountActionKind.Cancel);
+        int y = 36;
+        foreach (var a in list.Take(visible))
+        {
+            var name = string.IsNullOrEmpty(a.PersonaName) ? (a.Username == "" ? $"ID {a.AccountId}" : a.Username) : a.PersonaName;
+            if (name.Length > 28) name = name[..28] + "…";
+            var btn = new FancyButton
+            {
+                Text = (a.AccountId == activeId ? "✓ " : "") + $"{name}  ·  {a.Matches.Count} игр",
+                Bounds = new Rectangle(16, y, 388, 36), Primary = a.AccountId == activeId
+            };
+            btn.Click += (_, _) => { result = new AccountAction(AccountActionKind.Switch, a.AccountId); f.DialogResult = DialogResult.OK; f.Close(); };
+            f.Controls.Add(btn);
+            y += 42;
+        }
+        var add = new FancyButton { Text = "＋ Добавить аккаунт", Bounds = new Rectangle(16, y, 388, 36) };
+        add.Click += (_, _) => { result = new AccountAction(AccountActionKind.Add); f.DialogResult = DialogResult.OK; f.Close(); };
+        var cancel = new FancyButton { Text = "Отмена", Bounds = new Rectangle(16, y + 42, 388, 32), DialogResult = DialogResult.Cancel };
+        f.Controls.AddRange(new Control[] { add, cancel });
+        f.CancelButton = cancel;
+        f.ShowDialog(owner);
+        return result;
+    }
+}
+
+// ───────────────────────────── Вход в Steam: QR или логин/пароль ─────────────────────────────
+
+enum LoginChoice { Qr, Password, Cancel }
+enum AccountActionKind { Switch, Add, Cancel }
+record AccountAction(AccountActionKind Kind, uint AccountId = 0);
+
+/// Данные для GcClient.FetchAsync: либо готовый токен (QR), либо логин с паролем.
+record LoginInput(string User, string? Token, string? Password);
+
+static class Qr
+{
+    public static Bitmap Make(string text, int size = 260)
+    {
+        const int margin = 6;
+        var m = new QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, size - margin * 2, size - margin * 2);
+        var bmp = new Bitmap(size, size);
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.White);
+        for (int y = 0; y < m.Height; y++)
+            for (int x = 0; x < m.Width; x++)
+                if (m[x, y]) g.FillRectangle(Brushes.Black, x + margin, y + margin, 1, 1);
+        return bmp;
+    }
+}
+
+sealed class QrLoginForm : Form
+{
+    readonly PictureBox pic = new() { SizeMode = PictureBoxSizeMode.Zoom, Size = new Size(268, 268), Location = new Point(66, 46) };
+    readonly Label info = new()
+    {
+        Text = "Откройте приложение Steam на телефоне → «Войти по QR-коду» → наведите камеру.\nЗатем подтвердите вход на телефоне.",
+        ForeColor = Theme.Muted, Font = new Font("Segoe UI", 9F),
+        Location = new Point(16, 14), Size = new Size(388, 28)
+    };
+    public event Action? PasswordRequested;
+    public event Action? Cancelled;
+
+    public QrLoginForm()
+    {
+        Text = "Вход в Steam по QR-коду";
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        StartPosition = FormStartPosition.CenterParent;
+        ClientSize = new Size(420, 388);
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
+        BackColor = Theme.Side;
+        ForeColor = Theme.Text;
+        Font = new Font("Segoe UI", 9.5F);
+        HandleCreated += (_, _) => Native.DarkTitle(Handle);
+        var back = new FancyButton { Text = "Логин и пароль", Bounds = new Rectangle(16, 336, 184, 36), DialogResult = DialogResult.No };
+        var cancel = new FancyButton { Text = "Отмена", Bounds = new Rectangle(216, 336, 188, 36), DialogResult = DialogResult.Cancel };
+        back.Click += (_, _) => PasswordRequested?.Invoke();
+        cancel.Click += (_, _) => Cancelled?.Invoke();
+        Controls.AddRange(new Control[] { info, pic, back, cancel });
+        CancelButton = cancel;
+        FormClosed += (_, _) => Cancelled?.Invoke(); // крестик тоже отменяет вход
+    }
+
+    public void SetUrl(string url)
+    {
+        var old = pic.Image;
+        pic.Image = Qr.Make(url);
+        old?.Dispose();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) pic.Image?.Dispose();
+        base.Dispose(disposing);
+    }
 }
 
 // ───────────────────────────── Главное окно ─────────────────────────────
@@ -1900,7 +2050,8 @@ public class MainForm : Form, IMessageFilter
     static readonly Font KdaFont = new("Segoe UI Semibold", 9.5F);
     static readonly Font BoldCellFont = new("Segoe UI Semibold", 9.5F);
     readonly Settings settings = Storage.Load<Settings>("settings.json");
-    DataFile data = Storage.Load<DataFile>("data.json");
+    readonly Dictionary<uint, AccountData> accounts = LoadAccounts();
+    AccountData account;
     readonly TitleBar titleBar = new();
     readonly Panel sideFrame = new() { Dock = DockStyle.Left, Width = 320, BackColor = Theme.Side };
     readonly Panel mainFrame = new() { Dock = DockStyle.Fill, BackColor = Theme.Bg };
@@ -1959,12 +2110,79 @@ public class MainForm : Form, IMessageFilter
     readonly ToolStripStatusLabel statusLabel = new() { Text = "Готово" };
     readonly WinTimer watcher = new() { Interval = 15_000 };
     readonly WinTimer statsTimer = new() { Interval = 90_000 };
-    bool busy, enriching, wasDotaRunning, watching, dotaChecked;
-    bool? dotaState;                 // статус Dota по данным Steam: true/false, null — неизвестен
+    bool busy, enriching, watching, dotaChecked;
+    readonly Dictionary<uint, bool> dotaStates = new(); // статус Dota по каждому аккаунту
+    bool? dotaState;                 // общий статус для индикатора: true/false, null — неизвестен
     DateTime ignorePresenceUntil;    // после своей синхронизации Steam ещё пару секунд показывает «в игре»
+
+    static string AccountFile(uint id) => $"accounts/{id}.json";
+    static string DumpFile(uint id) => $"accounts/{id}-gc_dump.txt";
+
+    static Dictionary<uint, AccountData> LoadAccounts()
+    {
+        var map = new Dictionary<uint, AccountData>();
+        try
+        {
+            foreach (var f in Directory.GetFiles(Path.Combine(Storage.Dir, "accounts"), "*.json"))
+            {
+                var a = Storage.Load<AccountData>(Path.Combine("accounts", Path.GetFileName(f)));
+                if (a.AccountId != 0) map[a.AccountId] = a;
+            }
+        }
+        catch { }
+        return map;
+    }
+
+    /// Берём активный аккаунт; при первом запуске переносим историю из старого одного data.json.
+    AccountData PickAccount()
+    {
+        if (accounts.Count == 0)
+        {
+            var legacy = Storage.Load<DataFile>("data.json");
+            if (legacy.Matches.Count > 0 || settings.TokenEnc != "" || settings.AccountId != 0)
+            {
+                var a = new AccountData
+                {
+                    AccountId = settings.AccountId,
+                    Username = settings.Username,
+                    PersonaName = settings.PersonaName,
+                    TokenEnc = settings.TokenEnc,
+                    Matches = legacy.Matches
+                };
+                accounts[a.AccountId] = a;
+                SaveAccount(a);
+                settings.ActiveAccountId = a.AccountId;
+                settings.Username = "";
+                settings.PersonaName = "";
+                settings.TokenEnc = "";
+                settings.AccountId = 0;
+                Storage.Save("settings.json", settings);
+            }
+        }
+        if (accounts.TryGetValue(settings.ActiveAccountId, out var active)) return active;
+        var first = accounts.Values.FirstOrDefault();
+        if (first != null)
+        {
+            settings.ActiveAccountId = first.AccountId;
+            Storage.Save("settings.json", settings);
+            return first;
+        }
+        return new AccountData();
+    }
+
+    void SaveAccount(AccountData a)
+    {
+        if (a.AccountId != 0) Storage.Save(AccountFile(a.AccountId), a);
+    }
+
+    void DeleteAccountFile(uint id)
+    {
+        try { File.Delete(Path.Combine(Storage.Dir, AccountFile(id))); } catch { }
+    }
 
     public MainForm()
     {
+        account = PickAccount();
         Text = "Dota 2 MMR Tracker";
         Width = 1400;
         Height = 740;
@@ -2008,15 +2226,7 @@ public class MainForm : Form, IMessageFilter
                 : CaptionButton.Kind.Maximize;
 
         syncBtn.Click += async (_, _) => await SyncAsync(true);
-        accountBtn.Click += async (_, _) =>
-        {
-            settings.TokenEnc = "";
-            settings.Username = "";
-            settings.PersonaName = "";
-            SaveAll();
-            UpdateAccountInfo();
-            await SyncAsync(true);
-        };
+        accountBtn.Click += (_, _) => ManageAccounts();
         resetBtn.Click += (_, _) => ResetHistory();
         settingsBtn.Click += (_, _) => ToggleSettings();
         settingsTimer.Tick += (_, _) => StepSettings();
@@ -2048,16 +2258,17 @@ public class MainForm : Form, IMessageFilter
         {
             FadeIn();
             Rebind();
-            var first = await FetchDotaPresenceAsync();
+            var probe = await ProbeDotaAsync();
             dotaChecked = true;
-            dotaState = first;
-            wasDotaRunning = first == true;
-            SetDotaState(first);
+            foreach (var r in probe) if (r.State != null) dotaStates[r.Id] = r.State.Value;
+            dotaState = probe.Any(r => r.State == true) ? true : probe.Any(r => r.State == null) ? null : false;
+            SetDotaState(dotaState);
             _ = CheckUpdatesAsync();
             await HeroData.InitAsync();
             Rebind();
             _ = EnrichAsync(false, deep: true); // на старте добираем статистику и по старым матчам
-            if (settings.TokenEnc != "" && !wasDotaRunning) await SyncAsync(false);
+            if (account.TokenEnc != "" && !(dotaStates.TryGetValue(account.AccountId, out var run) && run))
+                await SyncAsync(false);
         };
     }
 
@@ -2257,7 +2468,7 @@ public class MainForm : Form, IMessageFilter
 
         var footer = new Label
         {
-            Text = "gl hf  ·  v2.4.4",
+            Text = "gl hf  ·  v2.4.5",
             Dock = DockStyle.Bottom,
             Height = 36,
             TextAlign = ContentAlignment.MiddleCenter,
@@ -2470,12 +2681,12 @@ public class MainForm : Form, IMessageFilter
     /// Спрашивает у Steam Community, запущена ли Dota 2 именно на аккаунте пользователя.
     /// true/false — статус известен; null — неизвестен (нет аккаунта, нет сети, профиль не публичный).
     /// Нужно, чтобы в настройках приватности Steam «Сведения об играх» были открыты.
-    async Task<bool?> FetchDotaPresenceAsync()
+    async Task<bool?> FetchDotaPresenceAsync(uint id)
     {
-        if (settings.AccountId == 0) return null;
+        if (id == 0) return null;
         try
         {
-            ulong id64 = settings.AccountId + 76561197960265728UL;
+            ulong id64 = id + 76561197960265728UL;
             string xml = await Http.GetStringAsync(
                 $"https://steamcommunity.com/profiles/{id64}?xml=1&t={DateTime.UtcNow.Ticks}");
             var root = XDocument.Parse(xml).Root;
@@ -2497,9 +2708,17 @@ public class MainForm : Form, IMessageFilter
     {
         dotaLabel.Active = running == true;
         dotaLabel.Text =
-            settings.AccountId == 0 ? "Dota 2: войдите в Steam" :
+            !accounts.Values.Any(a => a.AccountId != 0 && a.TokenEnc != "") ? "Dota 2: войдите в Steam" :
             running == null ? (dotaChecked ? "Статус Steam недоступен" : "Проверка Steam…") :
             running.Value ? "Dota 2 запущена" : "Dota 2 закрыта";
+    }
+
+    /// Опрашиваем presence по всем аккаунтам, у которых есть сохранённая сессия.
+    async Task<(uint Id, bool? State)[]> ProbeDotaAsync()
+    {
+        var ids = accounts.Values.Where(a => a.AccountId != 0 && a.TokenEnc != "")
+                                 .Select(a => a.AccountId).Distinct().ToList();
+        return await Task.WhenAll(ids.Select(async id => (Id: id, State: await FetchDotaPresenceAsync(id))));
     }
 
     async Task WatchDotaAsync()
@@ -2509,26 +2728,31 @@ public class MainForm : Form, IMessageFilter
         watching = true;
         try
         {
-            var state = await FetchDotaPresenceAsync();
+            var probe = await ProbeDotaAsync();
             if (busy || DateTime.UtcNow < ignorePresenceUntil) return;
             dotaChecked = true;
-            dotaState = state;
-            SetDotaState(state);
-            if (state == null) return;
-            bool running = state.Value;
-            if (wasDotaRunning && !running && autoToggle.Checked && settings.TokenEnc != "")
-                _ = DelayedSync();
-            wasDotaRunning = running;
+            foreach (var r in probe)
+            {
+                if (r.State == null) continue;
+                bool prev = dotaStates.TryGetValue(r.Id, out var p) && p;
+                if (prev && !r.State.Value && autoToggle.Checked) _ = DelayedSync(r.Id);
+                dotaStates[r.Id] = r.State.Value;
+            }
+            dotaState = probe.Any(r => r.State == true) ? true : probe.Any(r => r.State == null) ? null : false;
+            SetDotaState(dotaState);
         }
         finally { watching = false; }
     }
 
-    async Task DelayedSync()
+    async Task DelayedSync(uint id)
     {
         SetStatus("Dota закрыта — синхронизация через несколько секунд…");
         await Task.Delay(15_000);
         if (busy) return;
-        if (await FetchDotaPresenceAsync() != true) await SyncAsync(false);
+        if (await FetchDotaPresenceAsync(id) == true) return;
+        if (!accounts.ContainsKey(id)) return;
+        if (account.AccountId != id) SwitchAccount(id, false); // показываем аккаунт, который играл
+        if (!busy) await SyncAsync(false);
     }
 
     // ── Обновления (Velopack) ──
@@ -2571,14 +2795,14 @@ public class MainForm : Form, IMessageFilter
 
     void OpenProfile(string baseUrl)
     {
-        if (settings.AccountId == 0)
+        if (account.AccountId == 0)
         {
             SetStatus("Сначала войдите в Steam — нужен ID аккаунта");
             return;
         }
         try
         {
-            Process.Start(new ProcessStartInfo(baseUrl + settings.AccountId) { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo(baseUrl + account.AccountId) { UseShellExecute = true });
         }
         catch (Exception ex) { SetStatus("Не удалось открыть ссылку: " + ex.Message); }
     }
@@ -2631,10 +2855,98 @@ public class MainForm : Form, IMessageFilter
         return Task.FromResult(code);
     }
 
+    /// Показываем QR и ждём подтверждения. Кнопки в окне позволяют уйти в обычный вход по логину.
+    async Task<LoginInput?> AskQrAsync(CancellationToken ct)
+    {
+        var form = new QrLoginForm();
+        var action = new TaskCompletionSource<string>();
+        form.PasswordRequested += () => action.TrySetResult("password");
+        form.Cancelled += () => action.TrySetResult("cancel");
+        form.Show(this);
+
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        try
+        {
+            var login = GcClient.LoginViaQrAsync(
+                url => { try { BeginInvoke(() => form.SetUrl(url)); } catch { } },
+                () => { try { BeginInvoke(() => { if (!form.IsDisposed) form.Hide(); }); } catch { } },
+                SetStatus, linked.Token);
+
+            var done = await Task.WhenAny(login, action.Task);
+            if (done == action.Task)
+            {
+                linked.Cancel();
+                _ = login.ContinueWith(t => { _ = t.Exception; }, TaskScheduler.Default);
+                if (await action.Task == "password")
+                {
+                    if (!form.IsDisposed) form.Hide();
+                    var creds = Dialogs.AskCredentials(this, account.Username);
+                    return creds == null ? null : new LoginInput(creds.Value.User, null, creds.Value.Pass);
+                }
+                return null;
+            }
+            var auth = await login;
+            return new LoginInput(auth.User, auth.RefreshToken, null);
+        }
+        catch (OperationCanceledException ex)
+        {
+            SetStatus(ex.Message);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            SetStatus("Ошибка входа по QR: " + ex.Message);
+            return null;
+        }
+        finally
+        {
+            linked.Cancel();
+            if (!form.IsDisposed)
+            {
+                try { BeginInvoke(() => form.Close()); } catch { }
+            }
+        }
+    }
+
+    void ManageAccounts()
+    {
+        if (busy) { SetStatus("Дождитесь окончания синхронизации"); return; }
+        var list = accounts.Values.OrderBy(a =>
+            string.IsNullOrEmpty(a.PersonaName) ? a.Username : a.PersonaName).ToList();
+        var action = Dialogs.ManageAccounts(this, list, account.AccountId);
+        if (action.Kind == AccountActionKind.Add) AddAccount();
+        else if (action.Kind == AccountActionKind.Switch && action.AccountId != account.AccountId)
+            SwitchAccount(action.AccountId);
+    }
+
+    void SwitchAccount(uint id, bool sync = true)
+    {
+        if (!accounts.TryGetValue(id, out var next)) return;
+        SaveAccount(account);
+        account = next;
+        settings.ActiveAccountId = id;
+        SaveAll();
+        UpdateAccountInfo();
+        Rebind();
+        string name = string.IsNullOrEmpty(account.PersonaName) ? account.Username : account.PersonaName;
+        SetStatus($"Аккаунт: {name}");
+        if (sync && account.TokenEnc != "" &&
+            !(dotaStates.TryGetValue(account.AccountId, out var run) && run)) _ = SyncAsync(false);
+    }
+
+    void AddAccount()
+    {
+        SaveAccount(account);
+        account = new AccountData(); // ID и токен появятся после входа
+        UpdateAccountInfo();
+        _ = SyncAsync(true);
+    }
+
     async Task SyncAsync(bool manual)
     {
         if (busy) return;
-        if (wasDotaRunning)
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+        if (dotaStates.TryGetValue(account.AccountId, out var dotaRunning) && dotaRunning)
         {
             if (!manual) return;
             var answer = MessageBox.Show(this,
@@ -2644,33 +2956,78 @@ public class MainForm : Form, IMessageFilter
                 "Dota 2 запущена", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
             if (answer != DialogResult.Yes) return;
         }
-        string username = settings.Username;
+        string username = account.Username;
         string? password = null;
-        string? token = Storage.Unprotect(settings.TokenEnc);
+        string? token = Storage.Unprotect(account.TokenEnc);
         if (string.IsNullOrEmpty(token))
         {
             token = null;
-            var creds = Dialogs.AskCredentials(this, username);
-            if (creds == null) return;
-            username = creds.Value.User;
-            password = creds.Value.Pass;
+            var choice = Dialogs.AskLoginMethod(this);
+            if (choice == LoginChoice.Cancel) return;
+
+            LoginInput? input;
+            if (choice == LoginChoice.Qr)
+            {
+                input = await AskQrAsync(cts.Token);
+            }
+            else
+            {
+                var creds = Dialogs.AskCredentials(this, username);
+                input = creds == null ? null : new LoginInput(creds.Value.User, null, creds.Value.Pass);
+            }
+            if (input == null) return;
+
+            username = input.User;
+            password = input.Password;
+            token = input.Token;
+            if (token != null)
+            {
+                account.TokenEnc = Storage.Protect(token);
+                account.Username = username;
+                SaveAll();
+                UpdateAccountInfo();
+            }
         }
         busy = true;
         syncBtn.Enabled = accountBtn.Enabled = false;
         syncBtn.Text = "Синхронизация…";
         try
         {
-            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
             // При первом входе (нет сохранённой сессии) забираем максимум истории; при обычной синхронизации — последние 60 матчей.
             var res = await GcClient.FetchAsync(username, password, token, AskCodeAsync, SetStatus, cts.Token,
                 token == null ? 50 : 3);
-            if (res.NewRefreshToken != null)
+            // Вошли в другой аккаунт — переключаемся на его личные данные, не смешивая истории.
+            if (account.AccountId != res.AccountId)
             {
-                settings.TokenEnc = Storage.Protect(res.NewRefreshToken);
-                settings.Username = res.AccountName;
+                uint oldId = account.AccountId;
+                if (oldId != 0) SaveAccount(account);
+                if (accounts.TryGetValue(res.AccountId, out var existing))
+                {
+                    if (oldId == 0 && account.Matches.Count > 0)
+                    {
+                        var known = existing.Matches.Select(m => m.MatchId).ToHashSet();
+                        existing.Matches.AddRange(account.Matches.Where(m => !known.Contains(m.MatchId)));
+                    }
+                    account = existing;
+                }
+                else
+                {
+                    var fresh = new AccountData
+                    {
+                        AccountId = res.AccountId,
+                        Matches = oldId == 0 ? account.Matches : new List<MatchEntry>()
+                    };
+                    accounts[res.AccountId] = fresh;
+                    account = fresh;
+                }
+                settings.ActiveAccountId = res.AccountId;
+                if (oldId == 0) DeleteAccountFile(0);
             }
-            settings.AccountId = res.AccountId;
-            Storage.WriteText("gc_dump.txt", res.Dump);
+            account.AccountId = res.AccountId;
+            account.Username = res.AccountName;
+            if (res.NewRefreshToken != null) account.TokenEnc = Storage.Protect(res.NewRefreshToken);
+            else if (token != null && account.TokenEnc == "") account.TokenEnc = Storage.Protect(token);
+            Storage.WriteText(DumpFile(account.AccountId), res.Dump);
             int added = Import(res, out int abandonFixes);
             SaveAll();
             UpdateAccountInfo();
@@ -2678,7 +3035,7 @@ public class MainForm : Form, IMessageFilter
             SetStatus("Загрузка статистики матчей…");
             await EnrichAsync(true);
             bool anyRating = res.Matches.Any(m => m.PreviousRank > 0);
-            string dumpPath = Path.Combine(Storage.Dir, "gc_dump.txt");
+            string dumpPath = Path.Combine(Storage.Dir, DumpFile(account.AccountId));
             if (res.Matches.Count == 0)
                 SetStatus($"GC вернул пустую историю. Диагностика: {dumpPath}");
             else if (!anyRating)
@@ -2693,8 +3050,8 @@ public class MainForm : Form, IMessageFilter
         }
         catch (TokenRejectedException)
         {
-            settings.TokenEnc = "";
-            settings.PersonaName = "";
+            account.TokenEnc = "";
+            account.PersonaName = "";
             SaveAll();
             UpdateAccountInfo();
             SetStatus("Сессия Steam истекла — войдите заново.");
@@ -2714,6 +3071,13 @@ public class MainForm : Form, IMessageFilter
         }
         finally
         {
+            // Вход в новый аккаунт отменён/не удался — возвращаемся к прежнему.
+            if (account.AccountId == 0 && accounts.TryGetValue(settings.ActiveAccountId, out var back))
+            {
+                account = back;
+                UpdateAccountInfo();
+                Rebind();
+            }
             busy = false;
             ignorePresenceUntil = DateTime.UtcNow.AddSeconds(30);
             if (dotaState == null) { dotaChecked = false; SetDotaState(null); }
@@ -2724,7 +3088,7 @@ public class MainForm : Form, IMessageFilter
 
     int Import(GcResult res, out int abandonFixes)
     {
-        var known = data.Matches.GroupBy(m => m.MatchId).ToDictionary(g => g.Key, g => g.First());
+        var known = account.Matches.GroupBy(m => m.MatchId).ToDictionary(g => g.Key, g => g.First());
         int added = 0;
         abandonFixes = 0;
         foreach (var g in res.Matches)
@@ -2742,7 +3106,7 @@ public class MainForm : Form, IMessageFilter
                 }
                 continue;
             }
-            data.Matches.Add(new MatchEntry
+            account.Matches.Add(new MatchEntry
             {
                 MatchId = g.MatchId,
                 StartUtc = DateTimeOffset.FromUnixTimeSeconds(g.StartTime).UtcDateTime,
@@ -2761,23 +3125,26 @@ public class MainForm : Form, IMessageFilter
     }
 
     List<MatchEntry> PendingStats() =>
-        data.Matches.OrderByDescending(m => m.StartUtc).Take(40).Where(m => m.NeedsStats).ToList();
+        account.Matches.OrderByDescending(m => m.StartUtc).Take(40).Where(m => m.NeedsStats).ToList();
 
     /// Все матчи без статистики, а не только последние 40 — для глубокой подгрузки старых игр.
-    List<MatchEntry> PendingStatsAll() => data.Matches.Where(m => m.NeedsStats).ToList();
+    List<MatchEntry> PendingStatsAll() => account.Matches.Where(m => m.NeedsStats).ToList();
 
     /// Подтягивает K/D/A, GPM/XPM и т.д. из OpenDota для матчей без статистики.
     /// refreshFirst = true (кнопка «Синхронизировать» и автосинхронизация): сначала просим OpenDota
     /// обновить профиль, затем несколько раз опрашиваем API, пока матчи не появятся.
     async Task EnrichAsync(bool refreshFirst, bool deep = false)
     {
-        if (settings.AccountId == 0) return;
+        var target = account; // переключение аккаунта во время загрузки не должно подменить данные
+        if (target.AccountId == 0) return;
         // если фоновая подгрузка ещё идёт, дождёмся её, чтобы синхронизация точно отправила refresh
         while (enriching && refreshFirst) await Task.Delay(300);
         if (enriching) return;
 
         bool full = refreshFirst || deep;
-        List<MatchEntry> Missing() => full ? PendingStatsAll() : PendingStats();
+        List<MatchEntry> Missing() => full
+            ? target.Matches.Where(m => m.NeedsStats).ToList()
+            : target.Matches.OrderByDescending(m => m.StartUtc).Take(40).Where(m => m.NeedsStats).ToList();
         if (Missing().Count == 0) return;
 
         enriching = true;
@@ -2786,7 +3153,7 @@ public class MainForm : Form, IMessageFilter
             if (refreshFirst)
             {
                 SetStatus("Запрашиваю обновление у OpenDota…");
-                bool accepted = await OpenDota.RefreshAsync(settings.AccountId);
+                bool accepted = await OpenDota.RefreshAsync(target.AccountId);
                 if (!accepted) SetStatus("OpenDota не принял запрос обновления, пробую получить данные как есть…");
                 if (Missing().Count == 0) return;
                 await Task.Delay(3000); // OpenDota нужно время, чтобы забрать матчи из Steam
@@ -2803,7 +3170,7 @@ public class MainForm : Form, IMessageFilter
                 SetStatus(attempts > 1
                     ? $"Загружаю статистику из OpenDota ({attempt}/{attempts})…"
                     : "Загружаю статистику матчей из OpenDota…");
-                var recent = await OpenDota.RecentAsync(settings.AccountId, full ? 1000 : 40);
+                var recent = await OpenDota.RecentAsync(target.AccountId, full ? 1000 : 40);
                 if (recent != null)
                 {
                     reached = true;
@@ -2830,8 +3197,8 @@ public class MainForm : Form, IMessageFilter
 
             if (filled > 0)
             {
-                SaveAll();
-                Rebind();
+                SaveAccount(target);
+                if (target == account) Rebind();
             }
             int left = Missing().Count;
             if (!reached)
@@ -2856,7 +3223,7 @@ public class MainForm : Form, IMessageFilter
     void Recalc()
     {
         MatchEntry? prev = null;
-        foreach (var m in data.Matches.OrderBy(x => x.StartUtc).ThenBy(x => x.MatchId))
+        foreach (var m in account.Matches.OrderBy(x => x.StartUtc).ThenBy(x => x.MatchId))
         {
             m.Delta = null;
             m.Note = "";
@@ -2898,7 +3265,7 @@ public class MainForm : Form, IMessageFilter
         Recalc();
         int keepFirst = grid.FirstRow;
         grid.Rows.Clear();
-        foreach (var m in data.Matches.OrderByDescending(x => x.StartUtc).ThenByDescending(x => x.MatchId))
+        foreach (var m in account.Matches.OrderByDescending(x => x.StartUtc).ThenByDescending(x => x.MatchId))
         {
             int i = grid.Rows.Add(
                 Msk.FromUtc(m.StartUtc).ToString("dd.MM HH:mm"),
@@ -2927,7 +3294,7 @@ public class MainForm : Form, IMessageFilter
         UpdateStats();
         UpdateStatsView();
         if (HeroData.Ready)
-            _ = HeroData.LoadIconsAsync(data.Matches.Select(m => m.HeroId), () => { grid.Invalidate(); tileBest.Invalidate(); });
+            _ = HeroData.LoadIconsAsync(account.Matches.Select(m => m.HeroId), () => { grid.Invalidate(); tileBest.Invalidate(); });
     }
 
     string GetPeriodName() => currentPeriodIndex switch
@@ -2954,14 +3321,14 @@ public class MainForm : Form, IMessageFilter
 
     List<MatchEntry> GetFilteredMatchesForPeriod()
     {
-        var all = data.Matches.OrderBy(m => m.StartUtc).ThenBy(m => m.MatchId).ToList();
+        var all = account.Matches.OrderBy(m => m.StartUtc).ThenBy(m => m.MatchId).ToList();
         var from = PeriodStartUtc(currentPeriodIndex);
         return from == null ? all : all.Where(m => m.StartUtc >= from.Value).ToList();
     }
 
     void UpdateStats()
     {
-        var all = data.Matches.OrderBy(m => m.StartUtc).ThenBy(m => m.MatchId).ToList();
+        var all = account.Matches.OrderBy(m => m.StartUtc).ThenBy(m => m.MatchId).ToList();
         if (all.Count == 0)
         {
             cardRating.SetText("—", Theme.Muted, "нет данных");
@@ -3053,12 +3420,12 @@ public class MainForm : Form, IMessageFilter
 
     void UpdateAccountInfo()
     {
-        if (settings.TokenEnc != "" && settings.Username != "")
+        if (account.TokenEnc != "" && account.Username != "")
         {
-            personaLabel.Text = settings.PersonaName != "" ? settings.PersonaName : settings.Username;
+            personaLabel.Text = account.PersonaName != "" ? account.PersonaName : account.Username;
             avatarBox.Text = personaLabel.Text;
             accountSubLabel.Text = "Steam · подключено";
-            if (settings.AccountId != 0) _ = LoadProfileAsync();
+            if (account.AccountId != 0) _ = LoadProfileAsync();
         }
         else
         {
@@ -3072,26 +3439,30 @@ public class MainForm : Form, IMessageFilter
 
     async Task LoadProfileAsync()
     {
+        var a = account; // пока идёт запрос, активный аккаунт могли переключить
         try
         {
-            ulong id64 = settings.AccountId + 76561197960265728UL;
+            ulong id64 = a.AccountId + 76561197960265728UL;
             string xml = await Http.GetStringAsync($"https://steamcommunity.com/profiles/{id64}?xml=1");
             var root = XDocument.Parse(xml).Root;
             string? name = root?.Element("steamID")?.Value;
             string? url = root?.Element("avatarFull")?.Value;
             if (!string.IsNullOrWhiteSpace(name))
             {
-                settings.PersonaName = name;
-                personaLabel.Text = name;
-                avatarBox.Text = name;
-                Storage.Save("settings.json", settings);
+                a.PersonaName = name;
+                SaveAccount(a);
+                if (a == account)
+                {
+                    personaLabel.Text = name;
+                    avatarBox.Text = name;
+                }
             }
             if (!string.IsNullOrWhiteSpace(url))
             {
                 byte[] bytes = await Http.GetByteArrayAsync(url);
                 using var ms = new MemoryStream(bytes);
                 using var src = Image.FromStream(ms);
-                avatarBox.Image = new Bitmap(src);
+                if (a == account) avatarBox.Image = new Bitmap(src);
             }
         }
         catch { }
@@ -3107,7 +3478,7 @@ public class MainForm : Form, IMessageFilter
     {
         if (MessageBox.Show(this, "Удалить всю сохранённую историю матчей? Действие необратимо.",
             "Сброс", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-        data = new DataFile();
+        account.Matches.Clear();
         SaveAll();
         Rebind();
         SetStatus("История очищена");
@@ -3116,6 +3487,6 @@ public class MainForm : Form, IMessageFilter
     void SaveAll()
     {
         Storage.Save("settings.json", settings);
-        Storage.Save("data.json", data);
+        SaveAccount(account);
     }
 }
